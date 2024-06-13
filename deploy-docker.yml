@@ -1,0 +1,176 @@
+---
+- hosts: all
+  become: true
+  vars:
+    container_count: 4
+    default_container_name: docker
+    default_container_image: ubuntu
+    default_container_command: sleep 1d
+
+  tasks:
+    - name: Install aptitude
+      apt:
+        name: aptitude
+        state: latest
+        update_cache: true
+
+    - name: Install required system packages
+      apt:
+        pkg:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+        state: latest
+        update_cache: true
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu jammy stable
+        state: present
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Install python3-requests
+      apt:
+        name: python3-requests
+        state: latest
+        update_cache: true
+
+    - name: Pull default Docker image
+      community.docker.docker_image:
+        name: "{{ default_container_image }}"
+        source: pull
+
+    - name: Create default containers
+      community.docker.docker_container:
+        name: "{{ default_container_name }}{{ item }}"
+        image: "{{ default_container_image }}"
+        command: "{{ default_container_command }}"
+        state: present
+      with_sequence: count={{ container_count }}
+
+    - name: Create directory for Docker Compose plugins
+      file:
+        path: /root/.docker/cli-plugins
+        state: directory
+
+    - name: Download Docker Compose to temporary location
+      command: wget -O /tmp/docker-compose https://github.com/docker/compose/releases/download/v2.3.3/docker-compose-linux-x86_64
+      args:
+        creates: /tmp/docker-compose
+
+    - name: Move Docker Compose to final location
+      command: mv /tmp/docker-compose /root/.docker/cli-plugins/docker-compose
+
+    - name: Ensure Docker Compose is executable
+      file:
+        path: /root/.docker/cli-plugins/docker-compose
+        mode: '0755'
+        
+- hosts: slaves
+  become: true
+  tasks:
+    - name: Create directory for Web App
+      file:
+        path: /home/WebApp/
+        state: directory
+
+    - name: Clone Docker Compose repository on Slave
+      git:
+        repo: https://github.com/Adlaniq/dev_monorail.git
+        dest: /home/WebApp/
+        clone: yes
+
+    - name: Execute docker-compose up on Slave
+      become: yes
+      shell: docker compose -f /home/WebApp/docker-compose.yml up -d
+      args:
+        chdir: /home/WebApp/
+
+- hosts: prometheus
+  become: yes
+  tasks:
+    - name: Pull Prometheus image
+      docker_image:
+        name: prom/prometheus
+        source: pull
+
+    - name: Create Prometheus config directory
+      file:
+        path: /etc/prometheus
+        state: directory
+
+    - name: Download custom Prometheus config file from GitHub
+      get_url:
+        url: https://raw.githubusercontent.com/Adlaniq/dev_monorail/main/Prometheus/prometheus.yml
+        dest: /etc/prometheus/prometheus.yml
+
+    - name: Run Prometheus container
+      docker_container:
+        name: prometheus_container
+        image: prom/prometheus
+        state: started
+        restart_policy: always
+        ports:
+          - "9090:9090"
+        volumes:
+          - /etc/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+
+    - name: Pull the Grafana Docker image
+      docker_image:
+        name: grafana/grafana
+        source: pull
+
+    - name: Run Grafana container
+      docker_container:
+        name: grafana
+        image: grafana/grafana
+        state: started
+        ports:
+          - "3000:3000"
+        restart_policy: unless-stopped
+
+    - name: Download blackbox_exporter tarball
+      get_url:
+        url: "https://github.com/prometheus/blackbox_exporter/releases/download/v0.25.0/blackbox_exporter-0.25.0.linux-amd64.tar.gz"
+        dest: "/home/blackbox_exporter-0.25.0.linux-amd64.tar.gz"
+
+    - name: Extract blackbox_exporter tarball
+      ansible.builtin.unarchive:
+        src: "/home/blackbox_exporter-0.25.0.linux-amd64.tar.gz"
+        dest: "/home/"
+        remote_src: yes
+
+    - name: Ensure the target directory exists
+      file:
+        path: /home/blackbox_exporter
+        state: directory
+        mode: '0755'
+
+    - name: Run blackbox_exporter Docker container
+      ansible.builtin.shell:
+        cmd: "docker run -d -p 9115:9115/tcp --name blackbox_exporter -v $(pwd):/config quay.io/prometheus/blackbox-exporter:latest --config.file=/config/blackbox.yml"
+        chdir: "/home/blackbox_exporter-0.25.0.linux-amd64"  # Change directory to where blackbox_exporter is installed
+
+    - name: Verify blackbox_exporter is running
+      ansible.builtin.shell:
+        cmd: "docker ps"
+      register: docker_ps
+
+    - name: Print docker ps output
+      debug:
+        var: docker_ps.stdout
